@@ -1,0 +1,62 @@
+# Root Git ignore for frontend (Vite/React) + backend (FastAPI)
+
+# Node / frontend
+node_modules/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.cache/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+vite-cache/
+.DS_Store
+
+# Environment & secrets
+.env
+.env.*
+!*.example
+
+# Backend Python
+flare-backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+instance/
+.pytest_cache/
+.mypy_cache/
+coverage.xml
+htmlcov/
+.eggs/
+*.egg-info/
+
+# Uploaded / generated media
+flare-backend/uploaded_photos/
+
+# Virtual env variations
+.env/
+.venv/
+venv/
+ENV/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Misc
+.procfile
+*.bak
+*.orig
+
+uploaded_photos/
