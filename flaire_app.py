@@ -15,6 +15,8 @@ import jwt
 from sqlalchemy import create_engine, Column, String, DateTime, text
 from sqlalchemy.orm import declarative_base, Session
 from datetime import datetime
+import stripe
+from fastapi import Request
 
 # ---------------------------------------------------------------------------
 # Configuration & Environment
@@ -43,7 +45,7 @@ engine = create_engine(DATABASE_URL, echo=False, future=True) if DATABASE_URL el
 Base = declarative_base()
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (must be before Stripe config usage)
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -52,6 +54,19 @@ logging.basicConfig(
 logger = logging.getLogger("flaire_app")
 if not DATABASE_URL:
     logger.warning("DATABASE_URL not set; signup persistence disabled.")
+
+# Stripe configuration (optional; endpoints will guard if missing)
+STRIPE_SECRET_KEY = env_values.get("STRIPE_SECRET_KEY") or os.getenv("STRIPE_SECRET_KEY")
+STRIPE_PUBLISHABLE_KEY = env_values.get("STRIPE_PUBLISHABLE_KEY") or os.getenv("STRIPE_PUBLISHABLE_KEY")
+STRIPE_WEBHOOK_SECRET = env_values.get("STRIPE_WEBHOOK_SECRET") or os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_PRICE_ONE_TIME = env_values.get("STRIPE_PRICE_ONE_TIME") or os.getenv("STRIPE_PRICE_ONE_TIME")
+STRIPE_PRICE_SUB_MONTHLY = env_values.get("STRIPE_PRICE_SUB_MONTHLY") or os.getenv("STRIPE_PRICE_SUB_MONTHLY")
+STRIPE_SUCCESS_URL = env_values.get("STRIPE_SUCCESS_URL") or os.getenv("STRIPE_SUCCESS_URL") or "http://localhost:3000/checkout/success?session_id={CHECKOUT_SESSION_ID}"
+STRIPE_CANCEL_URL = env_values.get("STRIPE_CANCEL_URL") or os.getenv("STRIPE_CANCEL_URL") or "http://localhost:3000/checkout/cancel"
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
+else:
+    logger.info("Stripe not configured (STRIPE_SECRET_KEY missing); billing endpoints disabled.")
 
 # Lazy client init so import doesn't crash if proxies kw mismatch occurs
 _openai_client = None
@@ -144,6 +159,22 @@ class SignInRequest(BaseModel):
 
 class SignInResponse(SignUpResponse):
     pass
+
+class CreateCheckoutRequest(BaseModel):
+    mode: str  # "payment" or "subscription"
+    price_id: Optional[str] = None
+    quantity: Optional[int] = 1
+    metadata: Optional[Dict[str, str]] = None
+
+class CheckoutSessionResponse(BaseModel):
+    id: str
+    url: str
+
+class BillingPortalRequest(BaseModel):
+    customer_id: str
+
+class BillingPortalResponse(BaseModel):
+    url: str
 
 # ---------------------------------------------------------------------------
 # Database Models
@@ -594,3 +625,83 @@ async def debug_routes():
         for r in app.router.routes
         if getattr(r, 'path', '').startswith('/')
     ]
+
+# ---------------------------------------------------------------------------
+# Stripe / Billing Endpoints
+# ---------------------------------------------------------------------------
+@app.post('/billing/create-checkout-session', response_model=CheckoutSessionResponse)
+def create_checkout_session(req: CreateCheckoutRequest, request: Request):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    mode = (req.mode or 'payment').lower().strip()
+    if mode not in ('payment', 'subscription'):
+        raise HTTPException(status_code=400, detail="mode must be 'payment' or 'subscription'")
+    price_id = req.price_id or (STRIPE_PRICE_SUB_MONTHLY if mode == 'subscription' else STRIPE_PRICE_ONE_TIME)
+    if not price_id:
+        raise HTTPException(status_code=400, detail="Missing price_id and no default configured")
+    # Derive a client reference from JWT if provided
+    client_ref = "anon"
+    auth_header = request.headers.get('Authorization') or request.headers.get('authorization')
+    if auth_header and auth_header.lower().startswith('bearer '):
+        token = auth_header.split(' ',1)[1].strip()
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+            client_ref = payload.get('sub') or client_ref
+        except Exception:
+            pass
+    try:
+        session = stripe.checkout.Session.create(
+            mode=mode,
+            line_items=[{"price": price_id, "quantity": req.quantity or 1}],
+            success_url=STRIPE_SUCCESS_URL,
+            cancel_url=STRIPE_CANCEL_URL,
+            metadata=req.metadata or {},
+            allow_promotion_codes=True,
+            client_reference_id=client_ref
+        )
+        return CheckoutSessionResponse(id=session.id, url=session.url)
+    except Exception as e:
+        logger.warning("[STRIPE_CREATE_SESSION_FAIL] %s", e)
+        raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
+
+@app.post('/billing/portal', response_model=BillingPortalResponse)
+def create_billing_portal(req: BillingPortalRequest):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    try:
+        portal = stripe.billing_portal.Session.create(customer=req.customer_id, return_url=STRIPE_SUCCESS_URL.split('?')[0])
+        return BillingPortalResponse(url=portal.url)
+    except Exception as e:
+        logger.warning("[STRIPE_PORTAL_FAIL] %s", e)
+        raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
+
+@app.post('/stripe/webhook')
+async def stripe_webhook(request: Request):
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+    sig_header = request.headers.get('stripe-signature')
+    payload = await request.body()
+    try:
+        event = stripe.Webhook.construct_event(payload=payload, sig_header=sig_header, secret=STRIPE_WEBHOOK_SECRET)
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        logger.warning('[STRIPE_WEBHOOK_PARSE_FAIL] %s', e)
+        raise HTTPException(status_code=400, detail="Malformed payload")
+    etype = event.get('type')
+    obj = event.get('data', {}).get('object', {})
+    if etype == 'checkout.session.completed':
+        logger.info('[STRIPE] checkout.session.completed id=%s customer=%s', obj.get('id'), obj.get('customer'))
+    elif etype == 'invoice.paid':
+        logger.info('[STRIPE] invoice.paid subscription=%s', obj.get('subscription'))
+    elif etype in ('customer.subscription.updated', 'customer.subscription.deleted'):
+        logger.info('[STRIPE] %s id=%s status=%s', etype, obj.get('id'), obj.get('status'))
+    else:
+        logger.debug('[STRIPE] unhandled event=%s', etype)
+    return {'received': True}
+
+@app.get('/billing/config')
+async def billing_config():
+    if not STRIPE_PUBLISHABLE_KEY:
+        raise HTTPException(status_code=503, detail="Billing not configured")
+    return {"publishableKey": STRIPE_PUBLISHABLE_KEY}
